@@ -11,91 +11,199 @@ namespace LIFOBackgroundWorker
 {
     public class LIFOBackgroundWorker
     {
-        public ConcurrentStack<IStackObject> LIFOStack { get; private set; }
-        public List<IStackObject> StackObjectCollection { get; private set; }
-        private BackgroundWorker backgroundWorker;
-        private ManualResetEvent manualResetEvent;
-        private bool finishingExecution;
-        public event EventHandler<IStackObject> ItemProcessed;
-        public event EventHandler<List<IStackObject>> StackProcessed;
+        #region Public Properties
 
+
+        /// <summary>
+        /// The collection of all items added to the stack. 
+        /// </summary>
+        public IReadOnlyCollection<IStackItem> StackItemCollection
+        {
+            get
+            {
+                return stackItemCollection.AsReadOnly();
+            }
+        }
+
+        /// <summary>
+        /// Set to false to disable multithreading on the FinishExecution() processing calls.
+        /// </summary>
+        public bool UseMultithreading { get; set; } = true;
+
+        /// <summary>
+        /// This event is fired every time a new entry to the stack is processed. It will only fire on sequential entries and not during batch processing once FinishExecution() is called
+        /// </summary>
+        public event EventHandler<IStackItem> ItemProcessed;
+
+        /// <summary>
+        /// This event is fired when all processing is complete for every item added to the stack. Can only fire after FinishExecution() is called.
+        /// </summary>
+        public event EventHandler<List<IStackItem>> StackProcessed;
+        #endregion
+
+        #region Private Properties
+        /// <summary>
+        /// The current LIFO stack. This object will consumed entries item by item in a single thread, always grabbing the latest item on the stack.
+        /// </summary>
+        private ConcurrentStack<IStackItem> LIFOStack { get; set; }
+
+        private BackgroundWorker backgroundWorker;
+        private ManualResetEventSlim manualResetEvent;
+        private List<IStackItem> stackItemCollection { get; set; }
+        private bool finishingExecution;
+        #endregion
+
+        #region Constructors
         public LIFOBackgroundWorker()
         {
-            LIFOStack = new ConcurrentStack<IStackObject>();
-            StackObjectCollection = new List<IStackObject>();
+            LIFOStack = new ConcurrentStack<IStackItem>();
+            stackItemCollection = new List<IStackItem>();
             finishingExecution = false;
-            manualResetEvent = new ManualResetEvent(false);
+            manualResetEvent = new ManualResetEventSlim(false);
             backgroundWorker = new BackgroundWorker();
             backgroundWorker.WorkerSupportsCancellation = true;
             backgroundWorker.RunWorkerCompleted += BackgroundWorker_RunWorkerCompleted;
             backgroundWorker.DoWork += BackgroundWorker_DoWork;
         }
+        #endregion
 
+
+        #region Private Methods
         private void BackgroundWorker_DoWork(object sender, DoWorkEventArgs e)
         {
             BackgroundWorker localBGW = sender as BackgroundWorker;
             while (!localBGW.CancellationPending)
             {
-                manualResetEvent.WaitOne(); //wait for a object to be added to the stack. Also set when calling FinishExecution() or AbordExecution();
+                manualResetEvent.Wait(); //wait for a item to be added to the stack. Also set when calling FinishExecution() or AbordExecution();
                 manualResetEvent.Reset();
                 if (localBGW.CancellationPending)
-                {
+                {    
                     break;
-                } else if (finishingExecution)
+                }
+                else if (finishingExecution)
                 {
                     //Process the rest of the stack and break
-                    while(LIFOStack.Count > 0)
+                    processRemainingStackItems(UseMultithreading);
+                    break;
+                }
+                else if (LIFOStack.TryPop(out IStackItem result))
+                {
+                    ProcessIStackItem(result);
+                }
+            }
+
+            if (localBGW.CancellationPending)
+            {
+                e.Cancel = true;
+            }            
+        }
+
+        private void processRemainingStackItems(bool useThreading)
+        {
+            BlockingCollection<IStackItem> consumer = new BlockingCollection<IStackItem>(LIFOStack);
+            consumer.CompleteAdding();
+            try
+            {
+                if (consumer.Count > 0)
+                {
+                    if (useThreading)
                     {
-                        if (LIFOStack.TryPop(out IStackObject result))
+                        Parallel.ForEach(consumer.GetConsumingEnumerable(), (item) =>
                         {
-                            ProcessIStackObject(result);                            
+                            System.Diagnostics.Debug.WriteLine($"Thread ID: {System.Threading.Thread.CurrentThread.ManagedThreadId}");
+                            ProcessIStackItem(item, true);                            
+                        });
+                    }
+                    else
+                    {
+                        foreach (var item in consumer.GetConsumingEnumerable())
+                        {
+                            ProcessIStackItem(item, true);
                         }
                     }
-                    break;
-                } else if (LIFOStack.TryPop(out IStackObject result))
+                }
+            } catch (Exception ex)
+            {
+
+            }
+        }
+
+        private void ProcessIStackItem(IStackItem item, bool silenceEvents = false)
+        {
+            if (!item.IsProcessed)
+            {
+                item.Process();
+                item.IsProcessed = true;
+                if (!silenceEvents)
                 {
-                    ProcessIStackObject(result);
+                    ItemProcessed?.BeginInvoke(this, item, null, null);
                 }
             }
         }
 
-        private void ProcessIStackObject(IStackObject obj)
-        {
-            obj.Process();
-            obj.IsProcessed = true;
-            ItemProcessed?.Invoke(this, obj);
-        }
-
         private void BackgroundWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
         {
-            StackProcessed?.Invoke(this, StackObjectCollection);
+            if (!e.Cancelled && e.Error == null)
+            {
+                StackProcessed?.BeginInvoke(this, stackItemCollection, null, null);
+            }
+        }
+        #endregion
+
+        #region Public Methdos
+        /// <summary>
+        /// Erase all data in the stack.
+        /// </summary>
+        public void ClearStack()
+        {
+            LIFOStack.Clear();
+            stackItemCollection.Clear();
         }
 
+
+        /// <summary>
+        /// Start the background thread which will consume the IStackItems as they come in. 
+        /// </summary>
         public void StartExecution()
         {
+            finishingExecution = false;
             backgroundWorker.RunWorkerAsync();
         }
 
+        /// <summary>
+        /// Abort the background thread and do not process any of the data in the stack
+        /// </summary>
         public void AbortExecution()
         {
             backgroundWorker.CancelAsync();
             manualResetEvent.Set();
         }
 
+        /// <summary>
+        ///  Call this method to Finish processing the stack of data. This assumes no more items will be added to the stack.
+        /// </summary>
         public void FinishExecution()
         {
-            finishingExecution = true;
-            manualResetEvent.Set();
+            if (!finishingExecution)
+            {
+                finishingExecution = true;
+                manualResetEvent.Set();
+            }
         }
 
-        public void Add(IStackObject stackObject)
+        /// <summary>
+        /// Add a stackItem to the stack.
+        /// </summary>
+        /// <param name="stackObject"></param>
+        public void Add(IStackItem stackItem)
         {
-            LIFOStack.Push(stackObject);
-            StackObjectCollection.Add(stackObject);
-            manualResetEvent.Set();
+            if (!finishingExecution)
+            {
+                LIFOStack.Push(stackItem);
+                stackItemCollection.Add(stackItem);
+                manualResetEvent.Set();
+            }
         }
-
-
-
+        #endregion
     }
 }

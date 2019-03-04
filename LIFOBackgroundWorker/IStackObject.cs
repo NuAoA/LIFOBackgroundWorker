@@ -1,6 +1,6 @@
 ﻿namespace LIFOBackgroundWorker
 {
-    public interface IStackObject
+    public interface IStackItem
     {
         void Process();
         bool IsProcessed { get; set; }
